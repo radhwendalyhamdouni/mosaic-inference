@@ -77,10 +77,10 @@ fn top_p_sample(probs: &[f32], top_p: f32) -> Result<usize> {
     let r: f32 = rand_simple() * total;
     let mut accum = 0.0f32;
 
-    for (idx, prob) in candidates {
+    for (idx, prob) in &candidates {
         accum += prob;
         if accum >= r {
-            return Ok(idx);
+            return Ok(*idx);
         }
     }
 

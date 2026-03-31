@@ -38,6 +38,7 @@ pub struct MappedRegion {
 }
 
 /// Data type for tensor storage
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TensorDtype {
     F32,        // 32-bit float

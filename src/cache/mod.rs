@@ -12,7 +12,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::{info, debug};
 
 /// Disk-backed KV Cache for each layer
@@ -38,7 +38,7 @@ impl MemoryTier {
     pub fn new(
         ctx_size: usize,
         n_layers: usize,
-        ram_layers: usize,
+        _ram_layers: usize,
         cache_dir: &str,
     ) -> Self {
         // RAM holds the most recent tokens
@@ -85,18 +85,23 @@ impl MemoryTier {
             layer_cache.insert(token_pos, (k, v));
         } else {
             // Evict from RAM if present, store on disk
-            if let Some(layer_cache) = self.hot_cache.get_mut(&layer_idx) {
-                // Remove oldest entries that exceed ram_window
-                let keys_to_remove: Vec<usize> = layer_cache.keys()
-                    .filter(|&&pos| pos < token_pos.saturating_sub(self.ram_window_size))
-                    .copied()
-                    .collect();
-                for key in keys_to_remove {
-                    // Write to disk before removing
-                    if let Some((k, v)) = layer_cache.remove(&key) {
-                        self.write_kv_to_disk(layer_idx, key, &k, &v)?;
-                    }
+            let to_evict: Vec<(usize, Vec<f32>, Vec<f32>)> = {
+                if let Some(layer_cache) = self.hot_cache.get_mut(&layer_idx) {
+                    let keys_to_remove: Vec<usize> = layer_cache.keys()
+                        .filter(|&&pos| pos < token_pos.saturating_sub(self.ram_window_size))
+                        .copied()
+                        .collect();
+                    keys_to_remove.into_iter()
+                        .filter_map(|key| layer_cache.remove(&key).map(|(k, v)| (key, k, v)))
+                        .collect()
+                } else {
+                    Vec::new()
                 }
+            };
+
+            // Write evicted entries to disk
+            for (key, k_evict, v_evict) in to_evict {
+                self.write_kv_to_disk(layer_idx, key, &k_evict, &v_evict)?;
             }
 
             // Write current KV to disk

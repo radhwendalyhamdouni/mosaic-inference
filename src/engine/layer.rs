@@ -23,7 +23,6 @@
 //! Output ←──────────────────────────────────┘
 
 use crate::loader::ModelMetadata;
-use crate::loader::TensorDtype;
 use crate::engine::stream::LayerWeights;
 use anyhow::Result;
 use tracing::trace;

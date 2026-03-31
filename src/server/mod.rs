@@ -13,6 +13,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
+use tracing::{error, info};
 
 /// Application state shared across all requests
 type AppState = Arc<MosaicEngine>;
@@ -216,4 +217,3 @@ fn uuid_simple() -> String {
     format!("{:x}", t)[..12].to_string()
 }
 
-use tracing::error;

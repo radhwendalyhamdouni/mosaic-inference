@@ -17,7 +17,7 @@ pub fn final_forward(hidden: &[f32], model: &GgufModel) -> Result<Vec<f32>> {
 
     // 1. Final RMSNorm
     let norm_name = "output_norm.weight";
-    let normed = if let Some(norm_raw) = model.get_tensor_slice(norm_name)? {
+    let normed = if let Ok(norm_raw) = model.get_tensor_slice(norm_name) {
         simple_dequantize(norm_raw, n_embd)
     } else {
         hidden.to_vec()
@@ -32,7 +32,7 @@ pub fn final_forward(hidden: &[f32], model: &GgufModel) -> Result<Vec<f32>> {
     // This is the biggest operation - produces logits for every possible token
     let output_name = "output.weight";
 
-    let logits = if let Some(output_raw) = model.get_tensor_slice(output_name)? {
+    let logits = if let Ok(output_raw) = model.get_tensor_slice(output_name) {
         compute_logits(&normed, output_raw, n_embd, vocab_size)
     } else {
         // Fallback: generate pseudo-random logits

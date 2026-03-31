@@ -19,7 +19,8 @@ use byteorder::{LittleEndian, ReadBytesExt};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::{Cursor, Read};
+use tracing::info;
 use std::path::Path;
 
 use super::{MappedRegion, ModelMetadata, TensorDtype};
@@ -91,6 +92,11 @@ impl GgufModel {
             let value_type = cursor.read_u32::<LittleEndian>()?;
             let value = read_gguf_value(&mut cursor, value_type)?;
             metadata_map.insert(key, value);
+        }
+
+        // Debug: print all metadata keys
+        for (key, val) in &metadata_map {
+            tracing::info!("  [metadata] {} = {:?}", key, val);
         }
 
         // Extract model metadata from GGUF metadata
@@ -259,8 +265,15 @@ impl Value {
             Value::Uint64(v) => Some(*v),
             Value::Uint32(v) => Some(*v as u64),
             Value::Int32(v) => Some(*v as u64),
+            Value::Int64(v) => Some(*v as u64),
             Value::Uint16(v) => Some(*v as u64),
             Value::Uint8(v) => Some(*v as u64),
+            Value::Int8(v) => Some(*v as u64),
+            Value::Int16(v) => Some(*v as u64),
+            Value::Float32(v) => Some(*v as u64),
+            Value::Float64(v) => Some(*v as u64),
+            Value::Bool(v) => Some(if *v { 1 } else { 0 }),
+            Value::String(s) => s.parse::<u64>().ok(),
             _ => None,
         }
     }
@@ -335,11 +348,29 @@ fn extract_metadata(map: &HashMap<String, Value>) -> ModelMetadata {
             .unwrap_or(0)
     };
 
+    // Get vocab_size: some models store it directly, others only in tokenizer.ggml.tokens array
+    let arch = get_str("general.architecture");
+    let vocab_size = {
+        // Try direct key first (e.g., "llama.vocab_size")
+        let direct = get_u64(&format!("{}.vocab_size", arch));
+        if direct > 0 {
+            direct as usize
+        } else {
+            // Fallback: count tokens from tokenizer.ggml.tokens array
+            map.get("tokenizer.ggml.tokens")
+                .and_then(|v| match v {
+                    Value::Array(arr) => Some(arr.len()),
+                    _ => None,
+                })
+                .unwrap_or(32000) // reasonable default
+        }
+    };
+
     ModelMetadata {
         name: get_str("general.name"),
         version: get_str("general.version"),
-        architecture: get_str("general.architecture"),
-        vocab_size: get_u64(&format!("{}.vocab_size", get_str("general.architecture"))) as usize,
+        architecture: arch,
+        vocab_size,
         n_embd: get_u64(&format!("{}.embedding_length", get_str("general.architecture"))) as usize,
         n_head: get_u64(&format!("{}.attention.head_count", get_str("general.architecture"))) as usize,
         n_head_kv: {

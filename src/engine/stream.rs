@@ -13,6 +13,7 @@
 //! │  RAM:    [L0,L1]       [L1,L2]       │
 //! └──────────────────────────────────────┘
 
+use anyhow::Result;
 use crate::cache::MemoryTier;
 use crate::loader::gguf::GgufModel;
 use std::collections::HashMap;
@@ -234,7 +235,7 @@ fn load_layer_from_mmap(model: &GgufModel, layer_idx: usize) -> Result<LayerWeig
     let mut total_size = 0;
 
     for name in &tensor_names {
-        if let Some(region) = model.tensor_map.get(name) {
+        if let Some(_region) = model.tensor_map.get(name) {
             // Read from mmap - OS handles page faults automatically!
             // Only the 4KB pages we actually read get loaded into RAM
             let data = model.read_tensor_bytes(name)?;

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! # Mosaic Inference
 //!
 //! تشغيل أي نموذج لغوي كبير على أجهزة ضعيفة (4GB RAM)
@@ -83,7 +85,7 @@ async fn main() -> Result<()> {
 
     // Step 1: Load model metadata with mmap
     info!("Loading model metadata (mmap)...");
-    let model = loader::gguf::GgufLoader::load(&args.model)?;
+    let model = loader::gguf::GgufModel::load(&args.model)?;
 
     info!("Model: {} v{}", model.metadata.name, model.metadata.version);
     info!("Architecture: {}", model.metadata.architecture);

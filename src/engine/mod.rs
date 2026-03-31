@@ -74,21 +74,33 @@ impl MosaicEngine {
     pub async fn complete(&self, prompt: &str, max_tokens: usize) -> Result<String> {
         let tokens = self.tokenize_simple(prompt);
         info!("Input tokens: {}", tokens.len());
+        info!("Generating up to {} tokens (vocab_size={})", max_tokens, self.model.metadata.vocab_size);
 
         let mut output_tokens = Vec::new();
 
-        for _ in 0..max_tokens {
-            let next_token = self.forward_pass(&tokens, &output_tokens).await?;
-            output_tokens.push(next_token);
+        for step in 0..max_tokens {
+            info!("Step {}/{}: generating token...", step + 1, max_tokens);
+            match self.forward_pass(&tokens, &output_tokens).await {
+                Ok(next_token) => {
+                    info!("Step {}/{}: got token {}", step + 1, max_tokens, next_token);
+                    output_tokens.push(next_token);
 
-            // Check for EOS
-            if next_token == self.model.metadata.eos_token_id as usize {
-                break;
+                    // Check for EOS
+                    if next_token == self.model.metadata.eos_token_id as usize {
+                        info!("EOS token reached");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    info!("Forward pass error at step {}: {}, stopping", step, e);
+                    break;
+                }
             }
         }
 
         // Decode tokens to text (placeholder)
         let output_text = self.decode_tokens_simple(&output_tokens);
+        info!("Output: {} tokens, {} chars", output_tokens.len(), output_text.len());
         Ok(output_text)
     }
 
@@ -114,7 +126,7 @@ impl MosaicEngine {
             let layer_weights = self.streamer.load_layer(layer_idx).await?;
 
             // Forward through this layer
-            hidden_state = forward::layer_forward(
+            hidden_state = layer::layer_forward(
                 &hidden_state,
                 &layer_weights,
                 pos,
