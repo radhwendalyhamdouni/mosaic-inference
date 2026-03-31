@@ -1,0 +1,10 @@
+/target
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.kv_cache/
+*.gguf
+*.bin
+!tests/
