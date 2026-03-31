@@ -37,11 +37,15 @@ pub fn final_forward(hidden: &[f32], model: &GgufModel) -> Result<Vec<f32>> {
         vec![1.0f32; n_embd]
     };
 
-    // Apply RMSNorm
-    let sum_sq: f32 = hidden.iter().map(|&v| v * v).sum();
-    let rms = (sum_sq / n_embd as f32).sqrt() + 1e-6f32;
+    // Apply RMSNorm: x / sqrt(mean(x^2) + eps) * weight
+    // Use f64 for numerical stability
+    let sum_sq: f64 = hidden.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    let rms: f64 = (sum_sq / n_embd as f64 + 1e-5f64).sqrt();
     let normed: Vec<f32> = hidden.iter().zip(norm_vec.iter())
-        .map(|(&xi, &wi)| (xi / rms) * wi)
+        .map(|(&xi, &wi)| {
+            let n = (xi as f64) / rms;
+            (n * wi as f64) as f32
+        })
         .collect();
 
     let h_max: f32 = normed.iter().cloned().fold(f32::NEG_INFINITY, f32::max);

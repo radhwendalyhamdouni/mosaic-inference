@@ -6,8 +6,11 @@
 //! - Tokens [1,2] are <s>, </s> (type=3) - BOS/EOS special tokens
 //! - Remaining tokens are BPE merge results (type=1)
 //!
-//! Encoding: text → prepend_space → bytes → byte_token_ids → BPE merges
-//! Decoding: token_ids → token_strings → replace ▁ with space → trim
+//! CRITICAL: Encoding must map characters to their VOCAB tokens (like ▁, H, t),
+//! NOT to byte-fallback tokens (<0xHH>). The BPE merges reference vocab token
+//! strings, so if we use byte tokens, the merge lookup fails and no merges
+//! are applied - resulting in character-level tokenization that the model
+//! cannot understand.
 
 use std::collections::HashMap;
 
@@ -23,6 +26,10 @@ pub struct BpeTokenizer {
     byte_to_token: Vec<usize>,
     /// Precomputed token string → token_id
     token_to_id: HashMap<String, usize>,
+    /// Maps a single Unicode character (or ▁) to its vocab token ID.
+    /// This is the PRIMARY encoding map — most printable ASCII and common
+    /// Unicode characters have dedicated vocab entries.
+    char_to_token: HashMap<char, usize>,
 }
 
 impl BpeTokenizer {
@@ -35,8 +42,7 @@ impl BpeTokenizer {
         eos_id: usize,
         pad_id: usize,
     ) -> Self {
-        // Build byte → token mapping
-        // In GGML, byte tokens are type=6 and formatted as <0xHH>
+        // Build byte → token mapping (fallback for characters without vocab entries)
         let mut byte_to_token = vec![0usize; 256];
         let mut byte_count = 0;
 
@@ -62,10 +68,32 @@ impl BpeTokenizer {
             token_to_id.insert(tok.clone(), i);
         }
 
-        // Parse merges
+        // Build character → token ID map
+        // This maps single characters (and ▁) to their vocab token IDs.
+        // The SentencePiece space marker ▁ is critical - it's what the BPE
+        // merges reference, NOT the byte token <0x20>.
+        let mut char_to_token: HashMap<char, usize> = HashMap::new();
+        for (i, tok) in tokens.iter().enumerate() {
+            let tt = token_types.get(i).copied().unwrap_or(0);
+            // Skip special tokens (unk, bos, eos) and byte tokens
+            if tt == 2 || tt == 3 {
+                continue;
+            }
+            // Single-character token → direct mapping
+            if tok.chars().count() == 1 {
+                let ch = tok.chars().next().unwrap();
+                char_to_token.insert(ch, i);
+            }
+        }
+
+        tracing::info!(
+            "Tokenizer: {} tokens, {} byte-tokens, {} char-tokens, BOS={}, EOS={}",
+            tokens.len(), byte_count, char_to_token.len(), bos_id, eos_id
+        );
+
+        // Build merge table from token IDs (not strings) for faster matching
         let mut merges: Vec<(usize, usize)> = Vec::new();
         for merge_str in &merges_str {
-            // Find the first space to split "left right"
             if let Some(space_pos) = merge_str.find(' ') {
                 let left_str = &merge_str[..space_pos];
                 let right_str = &merge_str[space_pos + 1..];
@@ -73,17 +101,13 @@ impl BpeTokenizer {
                 let left_id = token_to_id.get(left_str).copied().unwrap_or(0);
                 let right_id = token_to_id.get(right_str).copied().unwrap_or(0);
 
-                // Only add if both sides exist
                 if token_to_id.contains_key(left_str) && token_to_id.contains_key(right_str) {
                     merges.push((left_id, right_id));
                 }
             }
         }
 
-        tracing::info!(
-            "Tokenizer: {} tokens, {} byte-tokens, {} merges, BOS={}, EOS={}",
-            tokens.len(), byte_count, merges.len(), bos_id, eos_id
-        );
+        tracing::info!("Tokenizer: {} valid merges parsed", merges.len());
 
         Self {
             tokens,
@@ -94,26 +118,43 @@ impl BpeTokenizer {
             pad_token_id: pad_id,
             byte_to_token,
             token_to_id,
+            char_to_token,
         }
     }
 
-    /// Encode text to token IDs
+    /// Encode text to token IDs using proper vocab token lookup + BPE merges
     pub fn encode(&self, text: &str) -> Vec<usize> {
         if text.is_empty() {
             return vec![self.bos_token_id];
         }
 
         // Step 1: Prepend space (SentencePiece convention)
-        let processed = format!(" {}", text);
-        let bytes = processed.as_bytes();
-
-        // Step 2: Map each byte to its token ID
-        let mut word: Vec<usize> = bytes.iter()
-            .map(|&b| self.byte_to_token[b as usize])
+        // Step 2: Replace spaces with ▁ (SentencePiece word boundary marker)
+        let processed: String = format!(" {}", text)
+            .chars()
+            .map(|c| if c == ' ' { '▁' } else { c })
             .collect();
 
-        // Step 3: Apply BPE merges
-        // Each merge combines two adjacent tokens into one
+        // Step 3: Map each CHARACTER to its vocab token ID
+        // - If the character has a direct vocab entry → use it (most common case)
+        // - If not → use byte fallback <0xHH>
+        // This is CRITICAL: the BPE merges reference vocab tokens like ▁ and H,
+        // NOT byte tokens like <0x20> and <0x48>
+        let mut word: Vec<usize> = Vec::new();
+        for ch in processed.chars() {
+            if let Some(&token_id) = self.char_to_token.get(&ch) {
+                word.push(token_id);
+            } else {
+                // Byte fallback: encode each UTF-8 byte of the character
+                for &byte in ch.to_string().as_bytes() {
+                    word.push(self.byte_to_token[byte as usize]);
+                }
+            }
+        }
+
+        // Step 4: Apply BPE merges (priority order)
+        // Each merge combines two adjacent tokens into one if the merged
+        // token exists in the vocabulary
         for &(left_id, right_id) in &self.merges {
             let mut i = 0;
             let mut new_word = Vec::with_capacity(word.len());
@@ -121,7 +162,6 @@ impl BpeTokenizer {
 
             while i < word.len() {
                 if i + 1 < word.len() && word[i] == left_id && word[i + 1] == right_id {
-                    // Try to find the merged token
                     let left_str = &self.tokens[left_id];
                     let right_str = &self.tokens[right_id];
                     let merged_str = format!("{}{}", left_str, right_str);

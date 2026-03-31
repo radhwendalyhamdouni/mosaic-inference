@@ -439,22 +439,22 @@ fn dequant_q5_k_block(block: &[u8]) -> Vec<f32> {
 //   [192..208] scales: 16 bytes  - signed int8 scales (one per 16-element sub-block)
 //   [208..210] d:     2 bytes   - f16 super-block scale
 //
-// Layout is NOT simple interleaved. From ggml dequantize_row_q6_K:
+// Translated from ggml-quants.c dequantize_row_q6_K:
 //   Process in 2 passes of 128 elements.
 //   For each pass (n=0, n=128):
-//     ql_base = n*64/128 = n/2 (so 0 or 64)
-//     qh_base = n*32/128 = n/4 (so 0 or 32)
-//     sc_base = n*8/128  = n/16 (so 0 or 8)
+//     ql_idx = n/4 + l (so pass 0: l, pass 1: 32+l)
+//     qh_idx = n/128*32 + l (so pass 0: l, pass 1: 32+l)
+//     sc_idx = is + n/128*8 (so pass 0: is+0..1, pass 1: is+8..9)
 //     For l in 0..31:
 //       is = l/16  (0 or 1)
-//       q1 = (ql[ql_base+l]     & 0xF) | (((qh[qh_base+l] >> 0) & 3) << 4)  - 32
-//       q2 = (ql[ql_base+l+32]  & 0xF) | (((qh[qh_base+l] >> 2) & 3) << 4)  - 32
-//       q3 = (ql[ql_base+l]     >> 4)  | (((qh[qh_base+l] >> 4) & 3) << 4)  - 32
-//       q4 = (ql[ql_base+l+32]  >> 4)  | (((qh[qh_base+l] >> 6) & 3) << 4)  - 32
-//       y[n+l]      = d * sc[sc_base+is+0] * q1
-//       y[n+l+32]   = d * sc[sc_base+is+0] * q2
-//       y[n+l+64]   = d * sc[sc_base+is+4] * q3
-//       y[n+l+96]   = d * sc[sc_base+is+4] * q4
+//       q1 = (ql[ql_idx]     & 0xF) | (((qh[qh_idx] >> 0) & 3) << 4)  - 32
+//       q2 = (ql[ql_idx+32]  & 0xF) | (((qh[qh_idx] >> 2) & 3) << 4)  - 32
+//       q3 = (ql[ql_idx]     >> 4)  | (((qh[qh_idx] >> 4) & 3) << 4)  - 32
+//       q4 = (ql[ql_idx+32]  >> 4)  | (((qh[qh_idx] >> 6) & 3) << 4)  - 32
+//       y[n+l]      = d * sc[sc_idx] * q1
+//       y[n+l+32]   = d * sc[sc_idx] * q2
+//       y[n+l+64]   = d * sc[sc_idx+4] * q3
+//       y[n+l+96]   = d * sc[sc_idx+4] * q4
 //
 // Translated from ggml-quants.c dequantize_row_q6_K
 // ============================================================
@@ -487,7 +487,7 @@ fn dequant_q6_k_block(block: &[u8]) -> Vec<f32> {
     // Two passes of 128 elements each
     for (pass, y_base) in [0usize, 128].iter().enumerate() {
         let y_base = *y_base;
-        let ql_base = pass * 64;  // 0 or 64
+        let ql_base = pass * 32;  // GGML: ql_idx = n/4 + l → pass 0: 0..31, pass 1: 32..63
         let qh_base = pass * 32;  // 0 or 32
         let sc_base = pass * 8;   // 0 or 8
 

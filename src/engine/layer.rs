@@ -142,6 +142,9 @@ fn get_norm_tensor(weights: &LayerWeights, name: &str, n: usize) -> Result<Vec<f
     }
 }
 
+/// RMSNorm epsilon — standard value for most LLaMA-based models
+const RMS_NORM_EPS: f64 = 1e-5;
+
 /// RMSNorm with f64 intermediate computation to prevent overflow
 fn safe_rms_norm(x: &[f32], weight: &[f32]) -> Vec<f32> {
     let n = x.len();
@@ -149,9 +152,10 @@ fn safe_rms_norm(x: &[f32], weight: &[f32]) -> Vec<f32> {
         return Vec::new();
     }
 
+    // RMSNorm: x / sqrt(mean(x^2) + eps) * weight
     // Use f64 for the sum of squares to avoid overflow
     let sum_sq: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum();
-    let rms: f64 = (sum_sq / n as f64).sqrt().max(MIN_RMS);
+    let rms: f64 = (sum_sq / n as f64 + RMS_NORM_EPS).sqrt();
 
     x.iter().zip(weight.iter()).map(|(&xi, &wi)| {
         let normalized = (xi as f64) / rms;
@@ -188,8 +192,11 @@ fn apply_rope(x: &[f32], pos: usize, head_dim: usize, n_rot: usize) -> Vec<f32> 
             let idx2 = ho + i + half_rot;
             if idx2 < result.len() {
                 let (v1, v2) = (result[idx1], result[idx2]);
-                result[idx1] = v1 * cos_val - v2 * sin_val;
-                result[idx2] = v1 * sin_val + v2 * cos_val;
+                // GGML/llama.cpp NEoX half-split convention:
+                //   dst[ic] = src[ic]*cos + src[id]*sin
+                //   dst[id] = src[id]*cos - src[ic]*sin
+                result[idx1] = v1 * cos_val + v2 * sin_val;
+                result[idx2] = v2 * cos_val - v1 * sin_val;
             }
         }
     }
