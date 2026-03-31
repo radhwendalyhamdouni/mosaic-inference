@@ -1,61 +1,45 @@
 //! Mosaic Inference Engine
 //!
-//! المحرك الأساسي الذي يجمع كل الابتكارات:
-//! 1. Layer Streaming: تحميل طبقة طبقة مع Double Buffering
-//! 2. Sparse Attention: تشغيل طبقات مختارة فقط (Circuit Stealing)
-//! 3. KV Cache Tiering: الذاكرة الهرمية (RAM → Disk)
-//! 4. Native Compilation: رجم الأوزان لتعليمات آلية
+//! المحرك الأساسي: Layer Streaming + mmap + KV Cache + Prefill
+//!
+//! Architecture:
+//! 1. Prefill: Process ALL prompt tokens through all layers, building KV cache
+//! 2. Decode: Process one token at a time, using cached KV from previous tokens
+//! 3. KV cache persists within a single generation request
 
 pub mod layer;
 pub mod forward;
 pub mod stream;
 
-use crate::cache::MemoryTier;
 use crate::loader::gguf::GgufModel;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use anyhow::Result;
 use tracing::info;
 
+/// Per-layer KV cache: stores (K, V) for each token position.
+/// kv_cache[layer_idx][token_pos] = (K_vec, V_vec)
+type KvCache = Vec<Vec<(Vec<f32>, Vec<f32>)>>;
+
 /// The core inference engine
-/// يدير سير التنفيذ: تحميل الطبقات → الحساب → تخزين KV → التوقع
 pub struct MosaicEngine {
-    /// Reference to the memory-mapped model (weights on disk!)
     model: Arc<GgufModel>,
-    /// Memory management (RAM + Disk tiers)
-    memory: Arc<RwLock<MemoryTier>>,
-    /// How many layers to keep in RAM simultaneously
-    ram_layers: usize,
-    /// Layer streaming pipeline
     streamer: stream::LayerStreamer,
 }
 
 impl MosaicEngine {
-    /// Create a new inference engine
-    pub fn new(
-        model: GgufModel,
-        memory: MemoryTier,
-        ram_layers: usize,
-    ) -> Self {
+    pub fn new(model: GgufModel, memory: crate::cache::MemoryTier, ram_layers: usize) -> Self {
         let model = Arc::new(model);
-        let memory = Arc::new(RwLock::new(memory));
+        let memory = Arc::new(tokio::sync::RwLock::new(memory));
 
         info!("Mosaic Engine initialized");
-        info!("Strategy: Layer Streaming with {} RAM layers", ram_layers);
+        info!("Strategy: Layer Streaming with mmap ({} RAM layers)", ram_layers);
 
         Self {
-            streamer: stream::LayerStreamer::new(
-                model.clone(),
-                memory.clone(),
-                ram_layers,
-            ),
+            streamer: stream::LayerStreamer::new(model.clone(), memory, ram_layers),
             model,
-            memory,
-            ram_layers,
         }
     }
 
-    /// Get model info for API responses
     pub fn model_info(&self) -> serde_json::Value {
         serde_json::json!({
             "name": self.model.metadata.name,
@@ -64,114 +48,155 @@ impl MosaicEngine {
             "n_layers": self.model.metadata.n_layers,
             "n_embd": self.model.metadata.n_embd,
             "n_head": self.model.metadata.n_head,
-            "ram_layers": self.ram_layers,
+            "n_head_kv": self.model.metadata.n_head_kv,
+            "n_ff": self.model.metadata.n_ff,
+            "ram_layers": 2,
             "file_size_mb": self.model.file_size / 1_048_576,
+            "has_tokenizer": self.model.tokenizer.is_some(),
         })
     }
 
-    /// Simple completion API
-    /// يأخذ رسالة ويعيد النص المُنتج
+    /// Simple completion API.
+    ///
+    /// This handles both prefill and decode in a single call:
+    /// 1. Encode prompt → token IDs
+    /// 2. Prefill: run all prompt tokens through all layers, building KV cache
+    /// 3. Decode: generate tokens one at a time using the KV cache
     pub async fn complete(&self, prompt: &str, max_tokens: usize) -> Result<String> {
-        let tokens = self.tokenize_simple(prompt);
-        info!("Input tokens: {}", tokens.len());
-        info!("Generating up to {} tokens (vocab_size={})", max_tokens, self.model.metadata.vocab_size);
+        let tokens = if let Some(ref tok) = self.model.tokenizer {
+            tok.encode(prompt)
+        } else {
+            prompt.chars().map(|c| c as usize + 3).collect()
+        };
 
-        let mut output_tokens = Vec::new();
+        info!("=== Generation Start ===");
+        info!("Prompt: \"{}\"", &prompt[..prompt.len().min(80)]);
+        info!("Input tokens: {:?} ({} total)", &tokens[..tokens.len().min(10)], tokens.len());
 
-        for step in 0..max_tokens {
-            info!("Step {}/{}: generating token...", step + 1, max_tokens);
-            match self.forward_pass(&tokens, &output_tokens).await {
-                Ok(next_token) => {
-                    info!("Step {}/{}: got token {}", step + 1, max_tokens, next_token);
-                    output_tokens.push(next_token);
+        if tokens.is_empty() {
+            return Ok(String::new());
+        }
 
-                    // Check for EOS
-                    if next_token == self.model.metadata.eos_token_id as usize {
-                        info!("EOS token reached");
-                        break;
-                    }
+        let n_layers = self.model.metadata.n_layers;
+        let eos_id = self.model.metadata.eos_token_id as usize;
+
+        // Initialize per-layer KV cache (empty for each layer)
+        let mut kv_cache: KvCache = vec![Vec::new(); n_layers];
+
+        // ──────────────────────────────────────────────
+        // Phase 1: PREFILL — process all prompt tokens
+        // ──────────────────────────────────────────────
+        info!("=== Prefill: processing {} prompt tokens ===", tokens.len());
+        let mut last_hidden = Vec::new();
+
+        for pos in 0..tokens.len() {
+            let token_id = tokens[pos];
+            let hidden = self.streamer.embed_token(token_id).await?;
+            let mut state = hidden;
+
+            for layer_idx in 0..n_layers {
+                let layer_weights = self.streamer.load_layer(layer_idx).await?;
+
+                state = layer::layer_forward_with_cache(
+                    &state,
+                    &layer_weights,
+                    pos,
+                    layer_idx,
+                    &self.model.metadata,
+                    &mut kv_cache[layer_idx],
+                )?;
+
+                // Log first and last few layers during prefill
+                if pos == tokens.len() - 1 && (layer_idx < 3 || layer_idx >= n_layers - 2) {
+                    let max_val = state.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let nan_count = state.iter().filter(|v| v.is_nan()).count();
+                    info!("Prefill Layer {}: max={:.4}, nan_count={}", layer_idx, max_val, nan_count);
                 }
-                Err(e) => {
-                    info!("Forward pass error at step {}: {}, stopping", step, e);
-                    break;
-                }
+            }
+
+            last_hidden = state;
+
+            // Log progress every 10 tokens
+            if (pos + 1) % 10 == 0 || pos == tokens.len() - 1 {
+                info!("Prefill progress: {}/{} tokens", pos + 1, tokens.len());
             }
         }
 
-        // Decode tokens to text (placeholder)
-        let output_text = self.decode_tokens_simple(&output_tokens);
-        info!("Output: {} tokens, {} chars", output_tokens.len(), output_text.len());
+        info!("=== Prefill complete ===");
+
+        // Get first generated token from the last prompt token's output
+        let logits = forward::final_forward(&last_hidden, &self.model)?;
+        let mut next_token = crate::sampler::sample_token(&logits, 0.8, 0.9)?;
+
+        let first_tok_str = self.model.tokenizer.as_ref()
+            .and_then(|t| t.tokens.get(next_token).cloned())
+            .unwrap_or_else(|| format!("<{}>", next_token));
+        info!("First generated token: {} ({:?})", next_token, first_tok_str);
+
+        if next_token == eos_id {
+            info!("EOS reached immediately after prefill");
+            return Ok(String::new());
+        }
+
+        let mut output_tokens = vec![next_token];
+
+        // ──────────────────────────────────────────────
+        // Phase 2: DECODE — generate one token at a time
+        // ──────────────────────────────────────────────
+        info!("=== Decode: generating up to {} tokens ===", max_tokens);
+
+        for step in 1..max_tokens {
+            let pos = tokens.len() + output_tokens.len() - 1;
+
+            // Embed only the new token
+            let hidden = self.streamer.embed_token(next_token).await?;
+            let mut state = hidden;
+
+            // Process through all layers (KV cache already has previous tokens)
+            for layer_idx in 0..n_layers {
+                let layer_weights = self.streamer.load_layer(layer_idx).await?;
+
+                state = layer::layer_forward_with_cache(
+                    &state,
+                    &layer_weights,
+                    pos,
+                    layer_idx,
+                    &self.model.metadata,
+                    &mut kv_cache[layer_idx],
+                )?;
+            }
+
+            // Final norm + LM head
+            let logits = forward::final_forward(&state, &self.model)?;
+
+            next_token = crate::sampler::sample_token(&logits, 0.8, 0.9)?;
+
+            let tok_str = self.model.tokenizer.as_ref()
+                .and_then(|t| t.tokens.get(next_token).cloned())
+                .unwrap_or_else(|| format!("<{}>", next_token));
+
+            info!("Step {}/{}: token={} ({:?})", step + 1, max_tokens, next_token, tok_str);
+            output_tokens.push(next_token);
+
+            if next_token == eos_id {
+                info!("EOS reached after {} generated tokens", output_tokens.len());
+                break;
+            }
+        }
+
+        // Decode output tokens to text
+        let output_text = if let Some(ref tok) = self.model.tokenizer {
+            tok.decode(&output_tokens)
+        } else {
+            output_tokens.iter()
+                .filter_map(|&t| if t > 3 { Some((t as u8).saturating_sub(3) as char) } else { None })
+                .collect()
+        };
+
+        info!("=== Generation Complete ===");
+        info!("Generated {} tokens: \"{}\"", output_tokens.len(),
+            if output_text.len() > 200 { format!("{}...", &output_text[..200]) } else { output_text.clone() });
+
         Ok(output_text)
-    }
-
-    /// Execute a full forward pass through selected layers
-    /// التنفيذ الأمامي: يمر على كل طبقة مطلوبة
-    async fn forward_pass(
-        &self,
-        prompt_tokens: &[usize],
-        generated_tokens: &[usize],
-    ) -> Result<usize> {
-        let all_tokens: Vec<usize> = prompt_tokens.iter()
-            .chain(generated_tokens.iter())
-            .copied()
-            .collect();
-
-        let pos = all_tokens.len() - 1; // Current position
-
-        // Layer-by-layer processing with streaming
-        let mut hidden_state = self.streamer.embed_token(all_tokens[pos]).await?;
-
-        for layer_idx in 0..self.model.metadata.n_layers {
-            // Load layer weights (streaming - only ram_layers in memory at once)
-            let layer_weights = self.streamer.load_layer(layer_idx).await?;
-
-            // Forward through this layer
-            hidden_state = layer::layer_forward(
-                &hidden_state,
-                &layer_weights,
-                pos,
-                layer_idx,
-                &self.model.metadata,
-            )?;
-
-            // Drop layer weights from RAM (frees memory for next layer!)
-            drop(layer_weights);
-
-            // Store KV cache
-            {
-                let mut mem = self.memory.write().await;
-                mem.store_kv(layer_idx, pos, &hidden_state)?;
-            }
-        }
-
-        // Final norm + projection
-        let logits = forward::final_forward(&hidden_state, &self.model)?;
-
-        // Sample next token
-        let next_token = crate::sampler::sample_token(&logits, 0.8, 1.0)?;
-
-        Ok(next_token)
-    }
-
-    /// Simple tokenization placeholder
-    /// في المرحلة الحالية: يقسم النص لكلمات بسيطة
-    /// المستقبل: سنستخدم tokenizer حقيقي من GGUF
-    fn tokenize_simple(&self, text: &str) -> Vec<usize> {
-        // Placeholder: character-level tokenization
-        // In production, we'd use the actual tokenizer from GGUF
-        text.chars().map(|c| c as usize + 3).collect()
-    }
-
-    /// Simple token decoding placeholder
-    fn decode_tokens_simple(&self, tokens: &[usize]) -> String {
-        tokens.iter()
-            .filter_map(|&t| {
-                if t > 3 {
-                    Some((t as u8 - 3) as char)
-                } else {
-                    None
-                }
-            })
-            .collect()
     }
 }

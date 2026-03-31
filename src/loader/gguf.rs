@@ -2,17 +2,6 @@
 //!
 //! GGUF هو تنسيق الملفات القياسي لمشروع GGML (llama.cpp)
 //! الميزة الأساسية: mmap يسمح بقراءة الأوزان من القرص بدون تحميلها كلها
-//!
-//! هيكل ملف GGUF:
-//! ┌─────────────────────────┐
-//! │ Magic: "GGUF" (4 bytes) │
-//! │ Version (uint32)        │
-//! │ Tensor count (uint64)   │
-//! │ Metadata KV count       │
-//! │ Metadata (key-value)    │
-//! │ Alignment padding       │
-//! │ Tensor data (offsets)   │
-//! └─────────────────────────┘
 
 use anyhow::{Context, Result};
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -23,12 +12,11 @@ use std::io::{Cursor, Read};
 use tracing::info;
 use std::path::Path;
 
-use super::{MappedRegion, ModelMetadata, TensorDtype};
+use super::{MappedRegion, ModelMetadata, TensorDtype, tokenizer::BpeTokenizer};
 
 /// A GGUF model loaded with memory-mapped I/O
-/// الملف يبقى على القرص، ونقرأ منه فقط ما نحتاجه
 pub struct GgufModel {
-    /// Memory-mapped file data (not in RAM until accessed!)
+    /// Memory-mapped file data
     pub mmap: Mmap,
     pub metadata: ModelMetadata,
     /// Mapping from tensor name to its location in the file
@@ -37,8 +25,12 @@ pub struct GgufModel {
     pub data_offset: usize,
     /// Total file size in bytes
     pub file_size: usize,
-    /// Tensor info: name -> (n_dims, dims, offset, type)
+    /// Tensor info
     tensor_infos: Vec<TensorInfo>,
+    /// Tokenizer loaded from GGUF metadata
+    pub tokenizer: Option<BpeTokenizer>,
+    /// Chat template if present
+    pub chat_template: Option<String>,
 }
 
 #[derive(Debug)]
@@ -52,7 +44,6 @@ struct TensorInfo {
 
 impl GgufModel {
     /// Load a GGUF model using memory-mapped I/O
-    /// الملف لا يُحمّل في RAM! فقط الـ metadata
     pub fn load(path: &str) -> Result<Self> {
         let path = Path::new(path);
         let file = File::open(path)
@@ -60,8 +51,6 @@ impl GgufModel {
 
         let file_size = file.metadata()?.len() as usize;
 
-        // Memory-map the entire file
-        // هذا لا يستهلك RAM! فقط يربط العنوان الافتراضي بالملف
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| "Failed to memory-map model file")?;
 
@@ -94,27 +83,25 @@ impl GgufModel {
             metadata_map.insert(key, value);
         }
 
-        // Debug: print all metadata keys
-        for (key, val) in &metadata_map {
-            tracing::info!("  [metadata] {} = {:?}", key, val);
-        }
-
-        // Extract model metadata from GGUF metadata
+        // Extract model metadata
         let metadata = extract_metadata(&metadata_map);
 
-        // Calculate alignment and data offset
+        // Extract tokenizer
+        let tokenizer = extract_tokenizer(&metadata_map);
+
+        // Extract chat template
+        let chat_template = metadata_map.get("tokenizer.chat_template")
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_string());
+
+        // Calculate alignment (will be used after tensor info to compute data_offset)
         let alignment = metadata_map
             .get("general.alignment")
             .and_then(|v| v.as_u64())
             .unwrap_or(32) as usize;
 
-        // Pad to alignment
-        let current_pos = cursor.position() as usize;
-        let data_offset = (current_pos + alignment - 1) / alignment * alignment;
-
-        info!("Data offset: {} bytes", data_offset);
-
-        // Read tensor info
+        // Read tensor info FIRST (before computing data_offset!)
+        // In GGUF format: header → metadata KV → tensor_info → alignment → tensor_data
         let mut tensor_infos = Vec::new();
         for _ in 0.._tensor_count {
             let name = read_gguf_string(&mut cursor)?;
@@ -139,6 +126,13 @@ impl GgufModel {
             });
         }
 
+        // NOW compute data_offset — after ALL tensor infos have been read!
+        // This is critical: tensor data starts after the tensor info section
+        let current_pos = cursor.position() as usize;
+        let data_offset = (current_pos + alignment - 1) / alignment * alignment;
+
+        info!("Data offset: {} bytes (after {} bytes of tensor info)", data_offset, current_pos);
+
         // Build tensor map
         let mut tensor_map = HashMap::new();
         for info in &tensor_infos {
@@ -155,6 +149,9 @@ impl GgufModel {
             );
         }
 
+        info!("Model loaded: {} tensors, vocab_size={}, layers={}, embd={}",
+            tensor_map.len(), metadata.vocab_size, metadata.n_layers, metadata.n_embd);
+
         Ok(GgufModel {
             mmap,
             metadata,
@@ -162,11 +159,12 @@ impl GgufModel {
             data_offset,
             file_size,
             tensor_infos,
+            tokenizer,
+            chat_template,
         })
     }
 
     /// Read raw bytes for a specific tensor from the memory-mapped file
-    /// يقرأ من القرص فقط الصفحات المطلوبة (lazy loading)
     pub fn read_tensor_bytes(&self, tensor_name: &str) -> Result<Vec<u8>> {
         let region = self.tensor_map
             .get(tensor_name)
@@ -179,12 +177,10 @@ impl GgufModel {
             );
         }
 
-        // This triggers a page fault → OS loads only the needed 4KB pages
         Ok(self.mmap[region.offset..region.offset + region.size].to_vec())
     }
 
     /// Get a reference to tensor data in the mmap (zero-copy!)
-    /// لا ينسخ البيانات! يعيد مرجع مباشر للبيانات المعيّنة في الذاكرة
     pub fn get_tensor_slice(&self, tensor_name: &str) -> Result<&[u8]> {
         let region = self.tensor_map
             .get(tensor_name)
@@ -198,7 +194,6 @@ impl GgufModel {
     }
 
     /// Get all tensor names for a specific layer
-    /// مثال: layer 5 → ["blk.5.attn_q.weight", "blk.5.attn_k.weight", ...]
     pub fn get_layer_tensors(&self, layer_idx: usize) -> Vec<String> {
         let prefix = format!("blk.{}.", layer_idx);
         self.tensor_map
@@ -238,10 +233,12 @@ impl GgufModel {
 /// Calculate tensor size in bytes based on shape and dtype
 fn calculate_tensor_size(dims: &[u64], dtype: &TensorDtype) -> usize {
     let total_elements: usize = dims.iter().map(|&d| d as usize).product();
-    (total_elements as f64 * dtype.bytes_per_weight()) as usize
+    let block_size = dtype.block_size();
+    let num_blocks = (total_elements + block_size - 1) / block_size;
+    num_blocks * dtype.block_bytes()
 }
 
-/// GGUF value types enum
+/// GGUF value types
 #[derive(Debug, Clone)]
 enum Value {
     Uint8(u8),
@@ -284,16 +281,33 @@ impl Value {
             _ => None,
         }
     }
+
+    fn as_f32(&self) -> Option<f32> {
+        match self {
+            Value::Float32(v) => Some(*v),
+            Value::Float64(v) => Some(*v as f32),
+            Value::Int32(v) => Some(*v as f32),
+            Value::Uint32(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    fn as_i32(&self) -> Option<i32> {
+        match self {
+            Value::Int32(v) => Some(*v),
+            Value::Int64(v) => Some(*v as i32),
+            Value::Uint32(v) => Some(*v as i32),
+            _ => None,
+        }
+    }
 }
 
-/// Read a fixed-length string from cursor
 fn read_string(cursor: &mut Cursor<&[u8]>, len: usize) -> Result<String> {
     let mut buf = vec![0u8; len];
     cursor.read_exact(&mut buf)?;
     Ok(String::from_utf8_lossy(&buf).to_string())
 }
 
-/// Read a GGUF string (length-prefixed)
 fn read_gguf_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     let len = cursor.read_u64::<LittleEndian>()? as usize;
     if len == 0 {
@@ -304,7 +318,6 @@ fn read_gguf_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     Ok(String::from_utf8(buf)?)
 }
 
-/// Read a GGUF value based on type
 fn read_gguf_value(cursor: &mut Cursor<&[u8]>, value_type: u32) -> Result<Value> {
     match value_type {
         0 => Ok(Value::Uint8(cursor.read_u8()?)),
@@ -317,7 +330,6 @@ fn read_gguf_value(cursor: &mut Cursor<&[u8]>, value_type: u32) -> Result<Value>
         7 => Ok(Value::Bool(cursor.read_u8()? != 0)),
         8 => Ok(Value::String(read_gguf_string(cursor)?)),
         9 => {
-            // Array
             let elem_type = cursor.read_u32::<LittleEndian>()?;
             let len = cursor.read_u64::<LittleEndian>()? as usize;
             let mut arr = Vec::with_capacity(len);
@@ -348,46 +360,101 @@ fn extract_metadata(map: &HashMap<String, Value>) -> ModelMetadata {
             .unwrap_or(0)
     };
 
-    // Get vocab_size: some models store it directly, others only in tokenizer.ggml.tokens array
     let arch = get_str("general.architecture");
-    let vocab_size = {
-        // Try direct key first (e.g., "llama.vocab_size")
-        let direct = get_u64(&format!("{}.vocab_size", arch));
-        if direct > 0 {
-            direct as usize
-        } else {
-            // Fallback: count tokens from tokenizer.ggml.tokens array
-            map.get("tokenizer.ggml.tokens")
-                .and_then(|v| match v {
-                    Value::Array(arr) => Some(arr.len()),
-                    _ => None,
-                })
-                .unwrap_or(32000) // reasonable default
-        }
-    };
+
+    // Get vocab_size from tokenizer.ggml.tokens array length
+    let vocab_size = map.get("tokenizer.ggml.tokens")
+        .and_then(|v| match v {
+            Value::Array(arr) => Some(arr.len()),
+            _ => None,
+        })
+        .unwrap_or(32000); // reasonable default
 
     ModelMetadata {
         name: get_str("general.name"),
         version: get_str("general.version"),
-        architecture: arch,
+        architecture: arch.clone(),
         vocab_size,
-        n_embd: get_u64(&format!("{}.embedding_length", get_str("general.architecture"))) as usize,
-        n_head: get_u64(&format!("{}.attention.head_count", get_str("general.architecture"))) as usize,
+        n_embd: get_u64(&format!("{}.embedding_length", arch)) as usize,
+        n_head: get_u64(&format!("{}.attention.head_count", arch)) as usize,
         n_head_kv: {
-            let v = get_u64(&format!("{}.attention.head_count_kv", get_str("general.architecture")));
+            let v = get_u64(&format!("{}.attention.head_count_kv", arch));
             if v == 0 { None } else { Some(v as usize) }
         },
-        n_layers: get_u64(&format!("{}.block_count", get_str("general.architecture"))) as usize,
+        n_layers: get_u64(&format!("{}.block_count", arch)) as usize,
         n_ff: {
-            let v = get_u64(&format!("{}.feed_forward_length", get_str("general.architecture")));
+            let v = get_u64(&format!("{}.feed_forward_length", arch));
             if v == 0 { None } else { Some(v as usize) }
         },
         n_rot: {
-            let v = get_u64(&format!("{}.rotary.dim", get_str("general.architecture")));
-            if v == 0 { None } else { Some(v as usize) }
+            let v = get_u64(&format!("{}.rope.dimension_count", arch));
+            if v == 0 {
+                let head_dim = get_u64(&format!("{}.attention.head_count", arch));
+                let embd = get_u64(&format!("{}.embedding_length", arch));
+                if head_dim > 0 && embd > 0 {
+                    Some((embd / head_dim) as usize)
+                } else {
+                    None
+                }
+            } else {
+                Some(v as usize)
+            }
         },
-        ftype: get_u64(&format!("{}.quantization_version", get_str("general.architecture"))) as u32,
+        ftype: get_u64(&format!("{}.quantization_version", arch)) as u32,
         bos_token_id: get_u64("tokenizer.ggml.bos_token_id") as u32,
         eos_token_id: get_u64("tokenizer.ggml.eos_token_id") as u32,
     }
+}
+
+/// Extract BPE tokenizer from GGUF metadata
+fn extract_tokenizer(map: &HashMap<String, Value>) -> Option<BpeTokenizer> {
+    // Extract tokens array
+    let tokens: Vec<String> = map.get("tokenizer.ggml.tokens")
+        .and_then(|v| match v {
+            Value::Array(arr) => Some(arr.iter().filter_map(|item| {
+                item.as_string().map(|s| s.to_string())
+            }).collect()),
+            _ => None,
+        })?;
+
+    // Extract scores array
+    let scores: Vec<f32> = map.get("tokenizer.ggml.scores")
+        .and_then(|v| match v {
+            Value::Array(arr) => Some(arr.iter().filter_map(|item| {
+                item.as_f32()
+            }).collect()),
+            _ => None,
+        })?;
+
+    // Extract token types array
+    let token_types: Vec<i32> = map.get("tokenizer.ggml.token_type")
+        .and_then(|v| match v {
+            Value::Array(arr) => Some(arr.iter().filter_map(|item| {
+                item.as_i32()
+            }).collect()),
+            _ => None,
+        }).unwrap_or_default();
+
+    // Extract merges array
+    let merges_str: Vec<String> = map.get("tokenizer.ggml.merges")
+        .and_then(|v| match v {
+            Value::Array(arr) => Some(arr.iter().filter_map(|item| {
+                item.as_string().map(|s| s.to_string())
+            }).collect()),
+            _ => None,
+        }).unwrap_or_default();
+
+    let bos_id = map.get("tokenizer.ggml.bos_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as usize;
+
+    let eos_id = map.get("tokenizer.ggml.eos_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2) as usize;
+
+    let pad_id = map.get("tokenizer.ggml.padding_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(eos_id as u64) as usize;
+
+    Some(BpeTokenizer::new(tokens, scores, merges_str, token_types, bos_id, eos_id, pad_id))
 }

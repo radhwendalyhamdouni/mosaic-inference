@@ -1,301 +1,270 @@
-//! Transformer Layer - Single layer forward pass
+//! Transformer Layer - Single layer forward pass with KV cache support
 //!
-//! هيكل الطبقة الواحدة في محول Transformer:
-//!
-//! Input
-//!   │
-//!   ├── RMSNorm ───────────────────────────┐
-//!   │    │                                  │ (Residual)
-//!   │    ├── Q/K/V Projections             │
-//!   │    ├── RoPE (Position Encoding)       │
-//!   │    ├── Self-Attention                 │
-//!   │    ├── Output Projection              │
-//!   │    └── Add (Skip Connection) ─────────┤
-//!   │                                       │
-//!   ├── RMSNorm ───────────────────────────┐
-//!   │    │                                  │ (Residual)
-//!   │    ├── FFN Gate + SiLU              │
-//!   │    ├── FFN Up                        │
-//!   │    ├── Multiply (Gate × Up)         │
-//!   │    ├── FFN Down                      │
-//!   │    └── Add (Skip Connection) ─────────┤
-//!   │                                       │
-//! Output ←──────────────────────────────────┘
+//! هيكل الطبقة الواحدة:
+//! Input → RMSNorm → Q/K/V → RoPE → Attention (with KV cache) → Output → +Residual
+//!        → RMSNorm → FFN(SwiGLU) → +Residual → Output
 
 use crate::loader::ModelMetadata;
 use crate::engine::stream::LayerWeights;
+use crate::loader::dequant::dequantize;
+use crate::loader::TensorDtype;
 use anyhow::Result;
 use tracing::trace;
 
-/// A single transformer layer configuration
-#[derive(Debug)]
-pub struct LayerConfig {
-    pub n_embd: usize,
-    pub n_head: usize,
-    pub n_head_kv: usize,
-    pub head_dim: usize,
-    pub n_ff: usize,
-    pub n_rot: usize,
-}
+/// Maximum hidden value magnitude to prevent numerical overflow
+const MAX_HIDDEN_VAL: f64 = 1e5;
+/// Minimum RMS value to prevent division issues
+const MIN_RMS: f64 = 1e-6;
 
-impl LayerConfig {
-    pub fn from_metadata(meta: &ModelMetadata) -> Self {
-        let n_head_kv = meta.n_head_kv.unwrap_or(meta.n_head);
-        Self {
-            n_embd: meta.n_embd,
-            n_head: meta.n_head,
-            n_head_kv,
-            head_dim: meta.n_embd / meta.n_head,
-            n_ff: meta.n_ff.unwrap_or(meta.n_embd * 8 / 3),
-            n_rot: meta.n_rot.unwrap_or(meta.n_embd / meta.n_head),
-        }
-    }
-}
-
-/// Execute forward pass through a single transformer layer
-pub fn layer_forward(
+/// Execute forward pass through a single transformer layer with KV cache.
+pub fn layer_forward_with_cache(
     hidden: &[f32],
     weights: &LayerWeights,
     pos: usize,
     layer_idx: usize,
     meta: &ModelMetadata,
+    kv_cache: &mut Vec<(Vec<f32>, Vec<f32>)>,
 ) -> Result<Vec<f32>> {
-    let config = LayerConfig::from_metadata(meta);
-    let n_embd = config.n_embd;
+    let n_embd = meta.n_embd;
+    let n_head = meta.n_head;
+    let n_head_kv = meta.n_head_kv.unwrap_or(n_head);
+    let head_dim = n_embd / n_head;
+    let n_ff = meta.n_ff.unwrap_or(n_embd * 8 / 3);
+    let n_rot = meta.n_rot.unwrap_or(head_dim);
 
-    trace!("Forward pass: layer {} at pos {}", layer_idx, pos);
-
-    // Save residual (skip connection)
     let residual_1 = hidden.to_vec();
 
-    // === Self-Attention Block ===
-    // 1. RMSNorm
-    let normed = rms_norm(hidden, &get_tensor_scale(weights, "blk.{}.attn_norm.weight", layer_idx, n_embd)?);
+    // === Self-Attention ===
+    let normed = safe_rms_norm(hidden, &get_norm_tensor(weights, &format!("blk.{}.attn_norm.weight", layer_idx), n_embd)?);
 
-    // 2. Q, K, V projections
-    let q = linear_q(&normed, weights, layer_idx, "attn_q", n_embd, config.n_head * config.head_dim)?;
-    let k = linear_q(&normed, weights, layer_idx, "attn_k", n_embd, config.n_head_kv * config.head_dim)?;
-    let v = linear_q(&normed, weights, layer_idx, "attn_v", n_embd, config.n_head_kv * config.head_dim)?;
+    let q = linear(&normed, weights, &format!("blk.{}.attn_q.weight", layer_idx), n_embd, n_embd)?;
+    let k_size = n_head_kv * head_dim;
+    let k = linear(&normed, weights, &format!("blk.{}.attn_k.weight", layer_idx), n_embd, k_size)?;
+    let v = linear(&normed, weights, &format!("blk.{}.attn_v.weight", layer_idx), n_embd, k_size)?;
 
-    // 3. RoPE (Rotary Position Embedding)
-    let q_rope = apply_rope(&q, pos, config.head_dim, config.n_rot);
-    let k_rope = apply_rope(&k, pos, config.head_dim, config.n_rot);
+    // Apply RoPE to Q and K
+    let q_rope = apply_rope(&q, pos, head_dim, n_rot);
+    let k_rope = apply_rope(&k, pos, head_dim, n_rot);
 
-    // 4. Self-Attention (simplified - single head)
-    let attn_out = scaled_dot_product_attention(
-        &q_rope,
-        &k_rope,
-        &v,
-        config.n_head,
-        config.n_head_kv,
-        config.head_dim,
-    )?;
+    // Store K, V in cache for this position
+    kv_cache.push((k_rope.clone(), v.clone()));
 
-    // 5. Output projection
-    let attn_proj = linear_q(&attn_out, weights, layer_idx, "attn_output", n_embd, n_embd)?;
+    // Multi-head attention over ALL cached positions
+    let attn_out = multi_head_attention_cached(&q_rope, kv_cache, n_head, n_head_kv, head_dim)?;
 
-    // 6. Add residual
-    let mut hidden_state = vec_add(&residual_1, &attn_proj, n_embd);
+    let attn_proj = linear(&attn_out, weights, &format!("blk.{}.attn_output.weight", layer_idx), n_embd, n_embd)?;
 
-    // === Feed-Forward Block (SwiGLU) ===
+    let mut hidden_state = vec_add(&residual_1, &attn_proj);
+
+    // Clip to prevent numerical overflow in subsequent layers
+    for val in hidden_state.iter_mut() {
+        *val = val.clamp(-MAX_HIDDEN_VAL as f32, MAX_HIDDEN_VAL as f32);
+    }
+
+    // === FFN (SwiGLU) ===
     let residual_2 = hidden_state.clone();
+    let normed_2 = safe_rms_norm(&hidden_state, &get_norm_tensor(weights, &format!("blk.{}.ffn_norm.weight", layer_idx), n_embd)?);
 
-    // 7. RMSNorm
-    let normed_2 = rms_norm(&hidden_state, &get_tensor_scale(weights, "blk.{}.ffn_norm.weight", layer_idx, n_embd)?);
+    let gate = linear(&normed_2, weights, &format!("blk.{}.ffn_gate.weight", layer_idx), n_embd, n_ff)?;
+    let up = linear(&normed_2, weights, &format!("blk.{}.ffn_up.weight", layer_idx), n_embd, n_ff)?;
 
-    // 8. FFN: gate = SiLU(norm * W_gate), up = norm * W_up, down = (gate * up) * W_down
-    let gate = linear_q(&normed_2, weights, layer_idx, "ffn_gate", n_embd, config.n_ff)?;
-    let up = linear_q(&normed_2, weights, layer_idx, "ffn_up", n_embd, config.n_ff)?;
+    let gate_up: Vec<f32> = gate.iter().zip(up.iter())
+        .map(|(&a, &b)| silu(a) * b)
+        .collect();
 
-    // 9. SiLU activation + element-wise multiply
-    let gate_silu: Vec<f32> = gate.iter().map(|&x| silu(x)).collect();
-    let gate_up: Vec<f32> = gate_silu.iter().zip(up.iter()).map(|(&a, &b)| a * b).collect();
+    let ffn_out = linear(&gate_up, weights, &format!("blk.{}.ffn_down.weight", layer_idx), n_ff, n_embd)?;
+    hidden_state = vec_add(&residual_2, &ffn_out);
 
-    // 10. Down projection
-    let ffn_out = linear_q(&gate_up, weights, layer_idx, "ffn_down", config.n_ff, n_embd)?;
-
-    // 11. Add residual
-    hidden_state = vec_add(&residual_2, &ffn_out, n_embd);
+    // Clip again
+    for val in hidden_state.iter_mut() {
+        *val = val.clamp(-MAX_HIDDEN_VAL as f32, MAX_HIDDEN_VAL as f32);
+    }
 
     Ok(hidden_state)
 }
 
-/// RMSNorm (Root Mean Square Normalization)
-/// أكثر كفاءة من LayerNorm - لا تحتاج mean subtraction
-fn rms_norm(x: &[f32], weight: &[f32]) -> Vec<f32> {
-    let n = x.len();
-    let sum_sq: f32 = x.iter().map(|&v| v * v).sum();
-    let rms = (sum_sq / n as f32).sqrt() + 1e-6;
-
-    x.iter()
-        .zip(weight.iter())
-        .map(|(&xi, &wi)| (xi / rms) * wi)
-        .collect()
-}
-
-/// SiLU activation function (Swish): x * sigmoid(x)
-#[inline(always)]
-fn silu(x: f32) -> f32 {
-    x * (1.0 / (1.0 + (-x).exp()))
-}
-
-/// Element-wise vector addition
-fn vec_add(a: &[f32], b: &[f32], n: usize) -> Vec<f32> {
-    a.iter().zip(b.iter()).take(n).map(|(&x, &y)| x + y).collect()
-}
-
-/// Get tensor scale (normalized weight for RMSNorm)
-fn get_tensor_scale(
-    weights: &LayerWeights,
-    pattern: &str,
-    layer_idx: usize,
-    n_embd: usize,
-) -> Result<Vec<f32>> {
-    let name = pattern.replace("{}", &layer_idx.to_string());
-    let raw = weights.get(&name)
-        .ok_or_else(|| anyhow::anyhow!("Tensor {} not found", name))?;
-
-    // For F32 tensors, direct conversion
-    if raw.len() == n_embd * 4 {
-        Ok(raw.chunks(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect())
-    } else {
-        // Approximate for other types
-        Ok(raw.iter().take(n_embd).map(|&b| b as f32 / 128.0).collect())
-    }
-}
-
-/// Simplified linear projection with quantized weights
-/// W: [out_features, in_features] × input: [in_features] → output: [out_features]
-fn linear_q(
+/// Matrix-vector multiply with quantized weights
+fn linear(
     input: &[f32],
     weights: &LayerWeights,
-    layer_idx: usize,
-    proj_name: &str,
+    tensor_name: &str,
     in_features: usize,
     out_features: usize,
 ) -> Result<Vec<f32>> {
-    let w_name = format!("blk.{}.{}.weight", layer_idx, proj_name);
-    let bias_name = format!("blk.{}.{}.bias", layer_idx, proj_name);
+    let raw = weights.get(tensor_name);
+    if raw.is_none() {
+        trace!("Tensor {} not found, returning zeros", tensor_name);
+        return Ok(vec![0.0f32; out_features]);
+    }
+    let raw = raw.unwrap();
 
-    let raw_w = weights.get(&w_name);
-    let raw_b = weights.get(&bias_name);
+    let dtype = weights.dtype_of(tensor_name).unwrap_or(TensorDtype::F32);
+    let w_shape: [usize; 2] = [in_features, out_features];
+    let dequant = dequantize(raw, dtype, &w_shape);
 
-    // Simplified matmul: treat weights as f32 or dequantize
-    let output = if let Some(w_raw) = raw_w {
-        if w_raw.len() >= out_features * in_features * 4 {
-            // F32 weights
-            let mut result = vec![0.0f32; out_features];
-            for i in 0..out_features {
-                let mut sum = 0.0f32;
-                for j in 0..in_features {
-                    let w_off = (i * in_features + j) * 4;
-                    let w = f32::from_le_bytes([w_raw[w_off], w_raw[w_off + 1], w_raw[w_off + 2], w_raw[w_off + 3]]);
-                    sum += w * input[j];
-                }
-                result[i] = sum;
+    if dequant.is_empty() {
+        return Ok(vec![0.0f32; out_features]);
+    }
+
+    let num_rows = (dequant.len() / in_features.max(1)).min(out_features);
+    let mut output = vec![0.0f32; out_features];
+
+    for j in 0..num_rows {
+        // Use f64 intermediate to prevent overflow with large weight/input values
+        let mut sum: f64 = 0.0;
+        let input_len = in_features.min(input.len());
+        for i in 0..input_len {
+            let idx = j * in_features + i;
+            if idx < dequant.len() {
+                sum += (dequant[idx] as f64) * (input[i] as f64);
             }
-
-            // Add bias if present
-            if let Some(b_raw) = raw_b {
-                if b_raw.len() >= out_features * 4 {
-                    for i in 0..out_features {
-                        let b_off = i * 4;
-                        result[i] += f32::from_le_bytes([b_raw[b_off], b_raw[b_off + 1], b_raw[b_off + 2], b_raw[b_off + 3]]);
-                    }
-                }
-            }
-
-            result
-        } else {
-            // Quantized weights - simplified dequantization
-            let mut result = vec![0.0f32; out_features];
-            for i in 0..out_features {
-                let mut sum = 0.0f32;
-                for j in 0..in_features.min(w_raw.len()) {
-                    sum += (w_raw[i * in_features + j] as f32 / 128.0) * input[j];
-                }
-                result[i] = sum;
-            }
-            result
         }
-    } else {
-        // Tensor not found - return zeros (placeholder for incomplete models)
-        vec![0.0f32; out_features]
-    };
+        let val = sum as f32;
+        // Clamp to prevent downstream NaN/Inf propagation
+        output[j] = if val.is_finite() { val.clamp(-1e5, 1e5) } else { 0.0 };
+    }
 
     Ok(output)
 }
 
-/// Apply Rotary Position Embedding (RoPE)
-/// يضيف معلومات الموقع للـ Query و Key
-/// بدون RoPE: النموذج لا يعرف ترتيب الكلمات!
+/// Get a norm tensor as F32
+fn get_norm_tensor(weights: &LayerWeights, name: &str, n: usize) -> Result<Vec<f32>> {
+    let raw = weights.get(name)
+        .ok_or_else(|| anyhow::anyhow!("Norm tensor {} not found", name))?;
+
+    if raw.len() >= n * 4 {
+        Ok(raw[..n * 4]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    } else {
+        Ok(vec![1.0f32; n])
+    }
+}
+
+/// RMSNorm with f64 intermediate computation to prevent overflow
+fn safe_rms_norm(x: &[f32], weight: &[f32]) -> Vec<f32> {
+    let n = x.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Use f64 for the sum of squares to avoid overflow
+    let sum_sq: f64 = x.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    let rms: f64 = (sum_sq / n as f64).sqrt().max(MIN_RMS);
+
+    x.iter().zip(weight.iter()).map(|(&xi, &wi)| {
+        let normalized = (xi as f64) / rms;
+        (normalized * wi as f64) as f32
+    }).collect()
+}
+
+#[inline(always)]
+fn silu(x: f32) -> f32 {
+    if x > 20.0 { return x; }
+    if x < -20.0 { return 0.0; }
+    x * (1.0 / (1.0 + (-x).exp()))
+}
+
+fn vec_add(a: &[f32], b: &[f32]) -> Vec<f32> {
+    a.iter().zip(b.iter()).map(|(&x, &y)| x + y).collect()
+}
+
+/// RoPE - Rotary Position Embedding
 fn apply_rope(x: &[f32], pos: usize, head_dim: usize, n_rot: usize) -> Vec<f32> {
     let mut result = x.to_vec();
     let half_rot = n_rot / 2;
+    let num_heads = x.len() / head_dim;
 
-    // Precompute frequencies
-    let freq_base = 10000.0f32;
-    for i in 0..half_rot.min(head_dim / 2) {
-        let freq = 1.0 / freq_base.powf(2.0 * i as f32 / n_rot as f32);
-        let angle = pos as f32 * freq;
-        let cos_val = angle.cos();
-        let sin_val = angle.sin();
+    for h in 0..num_heads {
+        let ho = h * head_dim;
+        for i in 0..half_rot.min(head_dim / 2) {
+            let freq = 1.0 / 10000.0f32.powf(2.0 * i as f32 / n_rot as f32);
+            let angle = pos as f32 * freq;
+            let cos_val = angle.cos();
+            let sin_val = angle.sin();
 
-        // Apply rotation to pairs of elements
-        let idx1 = i;
-        let idx2 = i + half_rot;
-
-        if idx2 < result.len() {
-            let v1 = result[idx1];
-            let v2 = result[idx2];
-            result[idx1] = v1 * cos_val - v2 * sin_val;
-            result[idx2] = v1 * sin_val + v2 * cos_val;
+            let idx1 = ho + i;
+            let idx2 = ho + i + half_rot;
+            if idx2 < result.len() {
+                let (v1, v2) = (result[idx1], result[idx2]);
+                result[idx1] = v1 * cos_val - v2 * sin_val;
+                result[idx2] = v1 * sin_val + v2 * cos_val;
+            }
         }
     }
-
     result
 }
 
-/// Scaled Dot-Product Attention (SDPA)
-/// جوهر آلية الانتباه الذاتي
-fn scaled_dot_product_attention(
+/// Multi-Head Attention with GQA and KV cache
+fn multi_head_attention_cached(
     q: &[f32],
-    k: &[f32],
-    v: &[f32],
+    kv_cache: &[(Vec<f32>, Vec<f32>)],
     n_head: usize,
     n_head_kv: usize,
     head_dim: usize,
 ) -> Result<Vec<f32>> {
+    let n_rep = n_head / n_head_kv;
+    let n_tokens = kv_cache.len();
     let mut output = vec![0.0f32; q.len()];
 
-    // Simplified: single token attention
-    // For each head, compute attention score
-    let n_rep = n_head / n_head_kv; // GQA: repeat KV heads
+    if n_tokens == 0 {
+        return Ok(output);
+    }
+
+    let inv_sqrt_d = 1.0 / (head_dim as f32).sqrt();
 
     for head in 0..n_head {
-        let kv_head = head / n_rep; // Which KV head to use
-        let q_start = head * head_dim;
-        let k_start = kv_head * head_dim;
-        let v_start = kv_head * head_dim;
+        let kv_head = head / n_rep;
+        let qs = head * head_dim;
+        let ks = kv_head * head_dim;
+        let vs = kv_head * head_dim;
 
-        // Compute dot product Q·K / sqrt(d)
-        let mut score = 0.0f32;
-        for j in 0..head_dim {
-            if q_start + j < q.len() && k_start + j < k.len() {
-                score += q[q_start + j] * k[k_start + j];
+        // Compute attention scores using f64 to prevent overflow
+        let mut scores = Vec::with_capacity(n_tokens);
+        for t in 0..n_tokens {
+            let k_vec = &kv_cache[t].0;
+            let mut score: f64 = 0.0;
+            for j in 0..head_dim {
+                let qi = qs + j;
+                let ki = ks + j;
+                if qi < q.len() && ki < k_vec.len() {
+                    score += (q[qi] as f64) * (k_vec[ki] as f64);
+                }
             }
+            // Scale and clamp
+            let score = (score * inv_sqrt_d as f64)
+                .clamp(-1e4, 1e4);
+            scores.push(score);
         }
-        score /= (head_dim as f32).sqrt();
 
-        // Softmax (simplified for single token: just sigmoid)
-        let weight = 1.0 / (1.0 + (-score).exp());
+        // Softmax (numerically stable with f64 intermediate)
+        let mut sum: f64 = 0.0f64;
+        let max_val = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        for score in scores.iter_mut() {
+            let diff = *score - max_val;
+            *score = if diff.is_nan() || diff.is_infinite() {
+                0.0
+            } else {
+                diff.exp().clamp(0.0, 1e10)
+            };
+            sum += *score;
+        }
 
         // Weighted sum of V
-        for j in 0..head_dim {
-            if q_start + j < output.len() && v_start + j < v.len() {
-                output[q_start + j] = weight * v[v_start + j];
+        if sum > 0.0 {
+            for j in 0..head_dim {
+                let oi = qs + j;
+                let vi = vs + j;
+                if oi >= output.len() { break; }
+                let mut val: f64 = 0.0;
+                for t in 0..n_tokens {
+                    let v_vec = &kv_cache[t].1;
+                    if vi < v_vec.len() {
+                        val += scores[t] * (v_vec[vi] as f64);
+                    }
+                }
+                output[oi] = val as f32;
             }
         }
     }

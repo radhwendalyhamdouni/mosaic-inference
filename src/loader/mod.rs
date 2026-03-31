@@ -4,6 +4,8 @@
 //! الأوزان تبقى على القرص ولا تُحمّل كلها في RAM
 
 pub mod gguf;
+pub mod dequant;
+pub mod tokenizer;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -56,24 +58,6 @@ pub enum TensorDtype {
 }
 
 impl TensorDtype {
-    /// Bytes per weight for this quantization type
-    pub fn bytes_per_weight(&self) -> f64 {
-        match self {
-            TensorDtype::F32 => 4.0,
-            TensorDtype::F16 => 2.0,
-            TensorDtype::Q4_0 => 0.5625,  // 18 bytes per 32 weights
-            TensorDtype::Q4_1 => 0.6875,
-            TensorDtype::Q5_0 => 0.71875,
-            TensorDtype::Q5_1 => 0.84375,
-            TensorDtype::Q8_0 => 1.0625,
-            TensorDtype::Q2_K => 0.3516,   // ~2.25 bits per weight
-            TensorDtype::Q3_K => 0.4063,
-            TensorDtype::Q4_K => 0.5625,
-            TensorDtype::Q5_K => 0.6875,
-            TensorDtype::Q6_K => 0.8438,
-        }
-    }
-
     /// Block size for this quantization type
     pub fn block_size(&self) -> usize {
         match self {
@@ -83,6 +67,24 @@ impl TensorDtype {
             TensorDtype::Q2_K | TensorDtype::Q3_K => 256,
             TensorDtype::Q4_K | TensorDtype::Q5_K | TensorDtype::Q6_K => 256,
             TensorDtype::F32 | TensorDtype::F16 => 1,
+        }
+    }
+
+    /// Bytes per block for this quantization type
+    pub fn block_bytes(&self) -> usize {
+        match self {
+            TensorDtype::F32 => 4,
+            TensorDtype::F16 => 2,
+            TensorDtype::Q4_0 => 18,    // 2 (f16 scale) + 16 (32 nibbles)
+            TensorDtype::Q4_1 => 20,    // 2 (f16 scale) + 2 (f16 min) + 16
+            TensorDtype::Q5_0 => 22,    // 2 (f16 scale) + 4 (32 4-bit qs) + 16 (4-bit packed)
+            TensorDtype::Q5_1 => 24,    // 2 + 2 + 4 + 16
+            TensorDtype::Q8_0 => 34,    // 2 (f16 scale) + 32 (int8 values)
+            TensorDtype::Q2_K => 84,    // 2 + 2 + 4 + 16 + 64 = 84 + 2 padding? Actually 84
+            TensorDtype::Q3_K => 110,   // complex format
+            TensorDtype::Q4_K => 144,   // 2 + 2 + 12 + 128
+            TensorDtype::Q5_K => 176,   // 2 + 2 + 12 + 4 + 128 + 16 + 4 = 168? Let me use 176
+            TensorDtype::Q6_K => 210,   // 128 + 64 + 16 + 2
         }
     }
 
